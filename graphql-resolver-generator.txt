@@ -1,0 +1,371 @@
+const fs = require('fs');
+const path = require('path');
+const { parse, buildASTSchema } = require('graphql');
+
+/**
+ * GraphQLResolverGenerator - An agent that automatically generates resolver functions
+ * from a GraphQL schema definition.
+ */
+class GraphQLResolverGenerator {
+  constructor(options = {}) {
+    this.options = {
+      defaultDataSources: {},
+      outputDir: './resolvers',
+      templatePath: null,
+      ...options
+    };
+    
+    this.typeMap = {};
+    this.resolvers = {};
+  }
+
+  /**
+   * Load schema from a file or string
+   * @param {string} schemaPath - Path to schema file or schema string
+   * @returns {Object} - Parsed schema
+   */
+  loadSchema(schemaPath) {
+    let schemaString;
+    
+    if (schemaPath.endsWith('.graphql') || schemaPath.endsWith('.gql')) {
+      schemaString = fs.readFileSync(schemaPath, 'utf8');
+    } else {
+      schemaString = schemaPath;
+    }
+    
+    const schemaAST = parse(schemaString);
+    this.schema = buildASTSchema(schemaAST);
+    this.typeMap = this.schema.getTypeMap();
+    
+    return this.schema;
+  }
+
+  /**
+   * Analyze the schema and prepare for resolver generation
+   */
+  analyzeSchema() {
+    if (!this.schema) {
+      throw new Error('Schema must be loaded before analysis');
+    }
+    
+    // Process Query type
+    const queryType = this.schema.getQueryType();
+    if (queryType) {
+      this._processObjectType('Query', queryType);
+    }
+    
+    // Process Mutation type
+    const mutationType = this.schema.getMutationType();
+    if (mutationType) {
+      this._processObjectType('Mutation', mutationType);
+    }
+    
+    // Process other object types
+    Object.keys(this.typeMap).forEach(typeName => {
+      const type = this.typeMap[typeName];
+      
+      // Skip built-in types and already processed types
+      if (
+        typeName.startsWith('__') || 
+        typeName === 'Query' || 
+        typeName === 'Mutation' ||
+        !type.getFields
+      ) {
+        return;
+      }
+      
+      this._processObjectType(typeName, type);
+    });
+    
+    return this.resolvers;
+  }
+
+  /**
+   * Process an object type and generate resolvers for its fields
+   * @param {string} typeName - Name of the type
+   * @param {Object} type - GraphQL type object
+   */
+  _processObjectType(typeName, type) {
+    if (!this.resolvers[typeName]) {
+      this.resolvers[typeName] = {};
+    }
+    
+    const fields = type.getFields();
+    
+    Object.keys(fields).forEach(fieldName => {
+      const field = fields[fieldName];
+      this.resolvers[typeName][fieldName] = this._generateResolver(typeName, fieldName, field);
+    });
+  }
+
+  /**
+   * Generate a resolver function for a field
+   * @param {string} typeName - Name of the type
+   * @param {string} fieldName - Name of the field
+   * @param {Object} field - GraphQL field object
+   * @returns {Function} - Resolver function
+   */
+  _generateResolver(typeName, fieldName, field) {
+    // Different resolver logic based on the type
+    if (typeName === 'Query') {
+      return this._generateQueryResolver(fieldName, field);
+    } else if (typeName === 'Mutation') {
+      return this._generateMutationResolver(fieldName, field);
+    } else {
+      return this._generateObjectFieldResolver(typeName, fieldName, field);
+    }
+  }
+
+  /**
+   * Generate a resolver for a Query field
+   * @param {string} fieldName - Name of the query
+   * @param {Object} field - GraphQL field object
+   * @returns {Function} - Resolver function
+   */
+  _generateQueryResolver(fieldName, field) {
+    const returnType = field.type.toString().replace(/[[\]!]/g, '');
+    const dataSource = this.options.defaultDataSources[returnType] || null;
+    
+    return async (parent, args, context, info) => {
+      // Template resolver logic
+      if (dataSource) {
+        if (field.type.toString().includes('[')) {
+          // List type
+          return await context.dataSources[dataSource].getAll(args);
+        } else {
+          // Single item
+          return await context.dataSources[dataSource].getById(args.id);
+        }
+      }
+      
+      // Default implementation
+      console.log(`Query resolver for '${fieldName}' executed with args:`, args);
+      return null; // Placeholder - should be implemented by developer
+    };
+  }
+
+  /**
+   * Generate a resolver for a Mutation field
+   * @param {string} fieldName - Name of the mutation
+   * @param {Object} field - GraphQL field object
+   * @returns {Function} - Resolver function
+   */
+  _generateMutationResolver(fieldName, field) {
+    const returnType = field.type.toString().replace(/[[\]!]/g, '');
+    const dataSource = this.options.defaultDataSources[returnType] || null;
+    
+    return async (parent, args, context, info) => {
+      // Template resolver logic
+      if (dataSource) {
+        if (fieldName.startsWith('create')) {
+          return await context.dataSources[dataSource].create(args.input);
+        } else if (fieldName.startsWith('update')) {
+          return await context.dataSources[dataSource].update(args.id, args.input);
+        } else if (fieldName.startsWith('delete')) {
+          return await context.dataSources[dataSource].delete(args.id);
+        }
+      }
+      
+      // Default implementation
+      console.log(`Mutation resolver for '${fieldName}' executed with args:`, args);
+      return null; // Placeholder - should be implemented by developer
+    };
+  }
+
+  /**
+   * Generate a resolver for an object field
+   * @param {string} typeName - Name of the type
+   * @param {string} fieldName - Name of the field
+   * @param {Object} field - GraphQL field object
+   * @returns {Function} - Resolver function
+   */
+  _generateObjectFieldResolver(typeName, fieldName, field) {
+    const returnType = field.type.toString().replace(/[[\]!]/g, '');
+    const dataSource = this.options.defaultDataSources[returnType] || null;
+    
+    return async (parent, args, context, info) => {
+      // If the field exists on the parent, just return it
+      if (parent && parent[fieldName] !== undefined) {
+        return parent[fieldName];
+      }
+      
+      // If we have a relationship with another type
+      if (dataSource) {
+        const foreignKeyField = `${fieldName}Id`;
+        const foreignKey = parent[foreignKeyField];
+        
+        if (foreignKey) {
+          if (field.type.toString().includes('[')) {
+            // One-to-many relationship
+            return await context.dataSources[dataSource].getByRelatedId(typeName.toLowerCase(), parent.id);
+          } else {
+            // Many-to-one relationship
+            return await context.dataSources[dataSource].getById(foreignKey);
+          }
+        }
+      }
+      
+      // Default implementation
+      console.log(`Object field resolver for '${typeName}.${fieldName}' executed`);
+      return null; // Placeholder - should be implemented by developer
+    };
+  }
+
+  /**
+   * Generate and save resolver files
+   * @param {string} outputDir - Directory to save the resolver files
+   */
+  generateFiles(outputDir = this.options.outputDir) {
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+    
+    // Generate index file
+    const indexPath = path.join(outputDir, 'index.js');
+    let indexContent = '// Auto-generated resolver index\n\n';
+    
+    // Generate resolver files for each type
+    Object.keys(this.resolvers).forEach(typeName => {
+      const filePath = path.join(outputDir, `${typeName}.js`);
+      let fileContent = `// Auto-generated resolvers for ${typeName}\n\n`;
+      
+      fileContent += `const ${typeName}Resolvers = {\n`;
+      
+      Object.keys(this.resolvers[typeName]).forEach(fieldName => {
+        fileContent += `  ${fieldName}: async (parent, args, context, info) => {\n`;
+        
+        if (typeName === 'Query') {
+          fileContent += `    // TODO: Implement query resolver for ${fieldName}\n`;
+          fileContent += `    console.log('Query ${fieldName} called with args:', args);\n`;
+          fileContent += `    // Example implementation:\n`;
+          fileContent += `    // return context.dataSources.yourDataSource.getItem(args);\n`;
+        } else if (typeName === 'Mutation') {
+          fileContent += `    // TODO: Implement mutation resolver for ${fieldName}\n`;
+          fileContent += `    console.log('Mutation ${fieldName} called with args:', args);\n`;
+          fileContent += `    // Example implementation:\n`;
+          fileContent += `    // return context.dataSources.yourDataSource.updateItem(args);\n`;
+        } else {
+          fileContent += `    // TODO: Implement field resolver for ${typeName}.${fieldName}\n`;
+          fileContent += `    // If this field exists directly on the parent object, you can just return it:\n`;
+          fileContent += `    if (parent && parent.${fieldName} !== undefined) return parent.${fieldName};\n`;
+          fileContent += `    \n`;
+          fileContent += `    // For relational fields, implement appropriate data fetching:\n`;
+          fileContent += `    // Example implementation for a relation:\n`;
+          fileContent += `    // return context.dataSources.yourDataSource.getRelatedItems(parent.id);\n`;
+        }
+        
+        fileContent += `    return null; // Replace with actual implementation\n`;
+        fileContent += `  },\n`;
+      });
+      
+      fileContent += `};\n\n`;
+      fileContent += `module.exports = ${typeName}Resolvers;\n`;
+      
+      fs.writeFileSync(filePath, fileContent);
+      
+      // Add to index
+      indexContent += `const ${typeName}Resolvers = require('./${typeName}');\n`;
+    });
+    
+    // Complete the index file
+    indexContent += '\nmodule.exports = {\n';
+    Object.keys(this.resolvers).forEach(typeName => {
+      indexContent += `  ${typeName}: ${typeName}Resolvers,\n`;
+    });
+    indexContent += '};\n';
+    
+    fs.writeFileSync(indexPath, indexContent);
+  }
+
+  /**
+   * Generate resolvers from a schema file
+   * @param {string} schemaPath - Path to schema file
+   * @param {Object} options - Generation options
+   * @returns {Object} - Generated resolvers
+   */
+  static generateFromSchema(schemaPath, options = {}) {
+    const generator = new GraphQLResolverGenerator(options);
+    generator.loadSchema(schemaPath);
+    generator.analyzeSchema();
+    
+    if (options.outputDir) {
+      generator.generateFiles(options.outputDir);
+    }
+    
+    return generator.resolvers;
+  }
+}
+
+// Example usage
+const exampleSchema = `
+  type User {
+    id: ID!
+    name: String!
+    email: String!
+    posts: [Post!]
+  }
+
+  type Post {
+    id: ID!
+    title: String!
+    content: String
+    author: User!
+  }
+
+  type Query {
+    user(id: ID!): User
+    users: [User!]!
+    post(id: ID!): Post
+    posts: [Post!]!
+  }
+
+  type Mutation {
+    createUser(input: UserInput!): User!
+    updateUser(id: ID!, input: UserInput!): User!
+    deleteUser(id: ID!): Boolean!
+    createPost(input: PostInput!): Post!
+  }
+
+  input UserInput {
+    name: String!
+    email: String!
+  }
+
+  input PostInput {
+    title: String!
+    content: String
+    authorId: ID!
+  }
+`;
+
+// Example of how to use the generator
+function runExample() {
+  // Method 1: Create instance and call methods individually
+  const generator = new GraphQLResolverGenerator({
+    outputDir: './generated-resolvers',
+    defaultDataSources: {
+      User: 'userDataSource',
+      Post: 'postDataSource'
+    }
+  });
+  
+  generator.loadSchema(exampleSchema);
+  generator.analyzeSchema();
+  generator.generateFiles();
+  
+  // Method 2: Use the static method for a one-liner
+  // GraphQLResolverGenerator.generateFromSchema(exampleSchema, { 
+  //   outputDir: './generated-resolvers',
+  //   defaultDataSources: {
+  //     User: 'userDataSource',
+  //     Post: 'postDataSource'
+  //   }
+  // });
+  
+  console.log('Resolvers generated successfully!');
+}
+
+// Uncomment to run the example
+// runExample();
+
+module.exports = GraphQLResolverGenerator;
