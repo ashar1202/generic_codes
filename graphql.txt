@@ -1,0 +1,237 @@
+import json
+import re
+from typing import List, Dict, Any, Union, Optional
+
+async def generate_graphql_schema(
+    llm_client: Any,
+    source: List[str],
+    target: List[str],
+    join: Dict[str, List[str]]
+) -> Dict[str, Any]:
+    """
+    Generate GraphQL schema and resolvers using an LLM.
+    
+    Args:
+        llm_client: LLM client with an async generate method
+        source: List of source entity names
+        target: List of target entity names
+        join: Dictionary mapping relationship names to join conditions
+        
+    Returns:
+        Dictionary containing schema, resolvers, and data sources
+    """
+    # Validate inputs
+    if not isinstance(source, list) or not all(isinstance(s, str) for s in source):
+        raise ValueError("Source must be a list of strings")
+    
+    if not isinstance(target, list) or not all(isinstance(t, str) for t in target):
+        raise ValueError("Target must be a list of strings")
+    
+    if not isinstance(join, dict):
+        raise ValueError("Join must be a dictionary")
+    
+    # Format join conditions for the prompt
+    join_conditions_text = ""
+    for relation, conditions in join.items():
+        join_conditions_text += f"Relation: {relation}\nJoin Fields: {', '.join(conditions)}\n\n"
+    
+    # Create the prompt for the LLM
+    prompt = f"""
+Generate a GraphQL schema and resolvers for the following entities and relationships:
+
+Source Entities: {", ".join(source)}
+Target Entities: {", ".join(target)}
+
+Join Conditions:
+{join_conditions_text}
+
+Please provide:
+1. GraphQL type definitions with query fields and relationships
+2. GraphQL resolver implementations that handle the join conditions
+3. Basic data source implementations
+
+Format your response with these specific section markers:
+SCHEMA:
+(schema code here)
+
+RESOLVERS:
+(resolver code here)
+
+DATASOURCES:
+(data source code here)
+"""
+    
+    try:
+        # Call the LLM to generate the schema
+        response = await llm_client.generate(prompt)
+        
+        # Extract sections from the response
+        schema = extract_section(response, "SCHEMA:")
+        resolvers = extract_section(response, "RESOLVERS:")
+        datasources = extract_section(response, "DATASOURCES:")
+        
+        return {
+            "success": True,
+            "schema": schema,
+            "resolvers": resolvers,
+            "datasources": datasources,
+            "full_response": response
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def extract_section(text: str, section_marker: str) -> str:
+    """
+    Extract a section from the LLM response text.
+    
+    Args:
+        text: The full LLM response text
+        section_marker: The marker indicating the start of the section
+        
+    Returns:
+        The extracted section text
+    """
+    if section_marker not in text:
+        return ""
+    
+    # Find the section start
+    start_index = text.find(section_marker) + len(section_marker)
+    
+    # Find the end of the section (next section marker or end of text)
+    section_markers = ["SCHEMA:", "RESOLVERS:", "DATASOURCES:"]
+    end_index = len(text)
+    
+    for marker in section_markers:
+        if marker == section_marker:
+            continue
+            
+        marker_pos = text.find(marker, start_index)
+        if marker_pos != -1 and marker_pos < end_index:
+            end_index = marker_pos
+    
+    # Extract and clean the section
+    section_text = text[start_index:end_index].strip()
+    return section_text
+
+# Example mock LLM client for demonstration
+class MockLLMClient:
+    async def generate(self, prompt: str) -> str:
+        """Mock LLM generation for demonstration purposes"""
+        print(f"Generating with prompt: {prompt[:100]}...")
+        
+        # In a real implementation, this would call your LLM API
+        return """
+SCHEMA:
+type Query {
+  transaction(id: ID!): Transaction
+  transactions: [Transaction!]!
+  position(id: ID!): Position
+  positions: [Position!]!
+}
+
+type Transaction {
+  id: ID!
+  reference: String!
+  amount: Float!
+  timestamp: String!
+  bus_cod: String!
+  account_number: String!
+  positions: [Position!]
+}
+
+type Position {
+  id: ID!
+  name: String!
+  value: Float!
+  bus_cod: String!
+  account_number: String!
+  transaction: Transaction
+}
+
+RESOLVERS:
+def get_resolvers():
+    return {
+        "Query": {
+            "transaction": lambda obj, info, id: get_transaction_by_id(id),
+            "transactions": lambda obj, info: get_all_transactions(),
+            "position": lambda obj, info, id: get_position_by_id(id),
+            "positions": lambda obj, info: get_all_positions()
+        },
+        "Transaction": {
+            "positions": lambda transaction, info: get_positions_by_fields({
+                "bus_cod": transaction.get("bus_cod"),
+                "account_number": transaction.get("account_number")
+            })
+        },
+        "Position": {
+            "transaction": lambda position, info: get_transaction_by_fields({
+                "bus_cod": position.get("bus_cod"),
+                "account_number": position.get("account_number")
+            })
+        }
+    }
+
+DATASOURCES:
+class TransactionDataSource:
+    def __init__(self, db_client):
+        self.db_client = db_client
+        self.collection = "transactions"
+    
+    def get_by_id(self, id):
+        return self.db_client.get(self.collection, id)
+    
+    def get_all(self):
+        return self.db_client.find_all(self.collection)
+    
+    def get_by_fields(self, fields):
+        return self.db_client.find_one(self.collection, fields)
+
+class PositionDataSource:
+    def __init__(self, db_client):
+        self.db_client = db_client
+        self.collection = "positions"
+    
+    def get_by_id(self, id):
+        return self.db_client.get(self.collection, id)
+    
+    def get_all(self):
+        return self.db_client.find_all(self.collection)
+    
+    def get_by_fields(self, fields):
+        return self.db_client.find(self.collection, fields)
+"""
+
+# Example usage
+async def example_usage():
+    import asyncio
+    
+    # Create the mock LLM client
+    llm_client = MockLLMClient()
+    
+    # Example inputs
+    source = ["Transaction"]
+    target = ["Position"]
+    join = {
+        "Transaction_to_Position": ["bus_cod:bus_cod", "account_number:account_number"]
+    }
+    
+    # Generate the GraphQL schema
+    result = await generate_graphql_schema(llm_client, source, target, join)
+    
+    # Print the results
+    if result["success"]:
+        print("GraphQL Schema Generation Successful!")
+        print(f"Schema (preview): {result['schema'][:100]}...")
+        print(f"Resolvers (preview): {result['resolvers'][:100]}...")
+    else:
+        print(f"Error: {result['error']}")
+    
+    return result
+
+# Run the example if this script is executed directly
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(example_usage())
