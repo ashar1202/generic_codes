@@ -94,6 +94,66 @@ def create_logical_model_from_physical(
             {"role": "user", "content": prompt}
         ]
     )
+  # Create the prompt for business analyst validation
+    validation_prompt = f"""
+    You are a Business Analyst and Master Data Management expert. A data modeler has created a logical data model 
+    based on a physical database schema. Your task is to review this logical model, identify any issues or 
+    misalignments with typical business practices, and suggest improvements.
+    
+    ## Physical Model Information
+    
+    ### Tables and Columns:
+    ```
+    {tables_str}
+    ```
+    
+    ### Relationships (Join Conditions):
+    ```
+    {relationships_str}
+    ```
+    
+    ### Business Context:
+    {business_context}
+    
+    ## Initial Logical Model:
+    ```json
+    {initial_logical_model_json}
+    ```
+    
+    ## Instructions:
+    
+    1. Review the logical model carefully
+    2. Check if the entities properly represent business concepts
+    3. Verify that relationships have appropriate cardinality and naming
+    4. Ensure that all business rules are correctly represented
+    5. Check for missing entities, attributes, or relationships that would be expected in this domain
+    6. Suggest improvements based on industry best practices and business requirements
+    7. Provide a revised logical model in the same JSON format
+    8. If you see any issues, clearly explain them and your reasoning for the suggested changes
+    
+    ## Output Format:
+    First, provide your analysis and suggestions. Then provide the revised logical model in the same JSON format as the initial model.
+    """
+    
+    # Call the Claude API for validation
+    validation_response = client.messages.create(
+        model="claude-3-7-sonnet-20250219",
+        max_tokens=4000,
+        temperature=0.2,
+        system="You are a Business Analyst and Master Data Management expert who reviews and improves logical data models.",
+        messages=[
+            {"role": "user", "content": validation_prompt}
+        ]
+    )
+    
+    # Extract the validation results
+    validation_results = validation_response.content[0].text
+    
+    # Return both the initial model and the validated/refined model
+    return {
+        "initial_logical_model": initial_logical_model,
+        "validation_and_refinement": validation_results
+    }
     
     # Extract and return the response
     return response.content[0].text
