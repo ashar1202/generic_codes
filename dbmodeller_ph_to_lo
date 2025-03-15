@@ -1,0 +1,122 @@
+import json
+import anthropic
+from typing import Dict, List, Tuple
+
+def create_logical_model_from_physical(
+    tables: Dict[str, List[str]],
+    relationships: List[Tuple[str, str, str, str]]
+) -> str:
+    """
+    Generate a logical data model from physical model information using an LLM.
+    
+    Args:
+        tables: Dictionary of table_name -> list of column names
+        relationships: List of tuples (table1, column1, table2, column2) representing join conditions
+        
+    Returns:
+        String representation of the logical data model
+    """
+    # Initialize Anthropic client (replace with your actual API key)
+    client = anthropic.Anthropic(api_key="your_api_key_here")
+    
+    # Format the physical model information for the prompt
+    tables_str = json.dumps(tables, indent=2)
+    
+    relationships_formatted = []
+    for t1, c1, t2, c2 in relationships:
+        relationships_formatted.append(f"{t1}.{c1} = {t2}.{c2}")
+    relationships_str = "\n".join(relationships_formatted)
+    
+    # Create the prompt for the model
+    prompt = f"""
+    You are a data modeling expert. I'll provide you with information about a physical data model, 
+    including tables, columns, and join conditions. Your task is to create a logical data model 
+    based on this information.
+    
+    ## Physical Model Information
+    
+    ### Tables and Columns:
+    ```
+    {tables_str}
+    ```
+    
+    ### Relationships (Join Conditions):
+    ```
+    {relationships_str}
+    ```
+    
+    ## Instructions:
+    
+    1. Analyze the physical model to understand the domain and data relationships
+    2. Convert tables to logical entities where appropriate
+    3. Identify and name relationships between entities
+    4. Abstract implementation details into business concepts
+    5. Present a clear logical data model with:
+       - Entities (with descriptions)
+       - Attributes for each entity (with descriptions)
+       - Relationships between entities (with cardinality)
+    6. Format the output as JSON
+    
+    ## Output Format:
+    ```json
+    {{
+      "entities": [
+        {{
+          "name": "EntityName",
+          "description": "Description of this entity",
+          "attributes": [
+            {{
+              "name": "attributeName",
+              "description": "Description of this attribute"
+            }}
+          ]
+        }}
+      ],
+      "relationships": [
+        {{
+          "entity1": "EntityName1",
+          "entity2": "EntityName2",
+          "type": "one-to-many",
+          "description": "Description of this relationship"
+        }}
+      ]
+    }}
+    ```
+    """
+    
+    # Call the Claude API
+    response = client.messages.create(
+        model="claude-3-7-sonnet-20250219",
+        max_tokens=4000,
+        temperature=0.2,
+        system="You are a data modeling expert who helps transform physical data models into logical data models.",
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    )
+    
+    # Extract and return the response
+    return response.content[0].text
+
+# Example usage
+if __name__ == "__main__":
+    # Example physical model
+    tables = {
+        "customers": ["customer_id", "first_name", "last_name", "email", "phone", "address_id", "created_at"],
+        "orders": ["order_id", "customer_id", "order_date", "total_amount", "status"],
+        "order_items": ["order_item_id", "order_id", "product_id", "quantity", "unit_price"],
+        "products": ["product_id", "name", "description", "category_id", "price", "stock_quantity"],
+        "categories": ["category_id", "name", "description"],
+        "addresses": ["address_id", "street", "city", "state", "postal_code", "country"]
+    }
+    
+    relationships = [
+        ("orders", "customer_id", "customers", "customer_id"),
+        ("order_items", "order_id", "orders", "order_id"),
+        ("order_items", "product_id", "products", "product_id"),
+        ("products", "category_id", "categories", "category_id"),
+        ("customers", "address_id", "addresses", "address_id")
+    ]
+    
+    logical_model = create_logical_model_from_physical(tables, relationships)
+    print(logical_model)
