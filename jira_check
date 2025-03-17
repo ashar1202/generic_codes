@@ -1,0 +1,401 @@
+import os
+import sys
+import json
+import time
+import logging
+import argparse
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Any, Optional, Union
+from datetime import datetime
+import traceback
+import re
+
+# Optional dependencies for expanded functionality
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+try:
+    from jira import JIRA
+    JIRA_AVAILABLE = True
+except ImportError:
+    JIRA_AVAILABLE = False
+
+try:
+    from openai import OpenAI
+    from openai.types.chat import ChatCompletion
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('jira_analyzer.log')
+    ]
+)
+logger = logging.getLogger("jira_analyzer")
+
+@dataclass
+class TicketAnalysis:
+    """Data class to store ticket analysis results"""
+    ticket_id: str
+    title: str
+    is_sufficient: bool
+    overall_score: float
+    criteria_scores: Dict[str, float]
+    missing_information: List[str]
+    suggested_questions: List[str]
+    analysis: str
+    timestamp: str = datetime.now().isoformat()
+    completion_tokens: int = 0
+    prompt_tokens: int = 0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+class JiraTicketAnalyzer:
+    """Class to analyze Jira tickets for code generation readiness"""
+    
+    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o"):
+        """Initialize the analyzer with API key and model"""
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("No API key provided. Set the OPENAI_API_KEY environment variable or pass it as an argument.")
+        
+        if not OPENAI_AVAILABLE:
+            raise ImportError("OpenAI package is not installed. Install it with 'pip install openai'")
+        
+        self.model = model
+        self.client = OpenAI(api_key=self.api_key)
+        self.system_prompt = """You are a senior software engineering consultant specializing in analyzing requirements for code generation. 
+You have deep expertise in software architecture, development best practices, and technical communication.
+Your task is to analyze Jira tickets and determine if they contain sufficient information for a developer to implement the requested feature or fix.
+Be thorough, precise, and actionable in your analysis."""
+    
+    def extract_ticket_info(self, ticket_content: str) -> Dict[str, str]:
+        """Extract structured information from raw ticket content"""
+        # Use regex to try to extract common Jira ticket fields
+        ticket_info = {
+            "id": "",
+            "title": "",
+            "description": ticket_content,
+            "type": "",
+            "priority": "",
+            "components": [],
+            "raw_content": ticket_content
+        }
+        
+        # Try to extract ticket ID
+        id_match = re.search(r'([A-Z]+-\d+)', ticket_content)
+        if id_match:
+            ticket_info["id"] = id_match.group(1)
+        
+        # Try to extract title
+        title_match = re.search(r'Title:\s*(.+)(?:\n|$)', ticket_content)
+        if title_match:
+            ticket_info["title"] = title_match.group(1).strip()
+        
+        # Try to extract type
+        type_match = re.search(r'Type:\s*(.+)(?:\n|$)', ticket_content)
+        if type_match:
+            ticket_info["type"] = type_match.group(1).strip()
+        
+        # Try to extract priority
+        priority_match = re.search(r'Priority:\s*(.+)(?:\n|$)', ticket_content)
+        if priority_match:
+            ticket_info["priority"] = priority_match.group(1).strip()
+            
+        return ticket_info
+    
+    def create_analysis_prompt(self, ticket_content: str) -> str:
+        """Create a detailed prompt for the LLM to analyze the ticket"""
+        ticket_info = self.extract_ticket_info(ticket_content)
+        
+        prompt = f"""
+# JIRA TICKET ANALYSIS TASK
+
+## Ticket Information
+{f'ID: {ticket_info["id"]}' if ticket_info["id"] else ''}
+{f'Title: {ticket_info["title"]}' if ticket_info["title"] else ''}
+{f'Type: {ticket_info["type"]}' if ticket_info["type"] else ''}
+{f'Priority: {ticket_info["priority"]}' if ticket_info["priority"] else ''}
+
+## Full Ticket Content
+```
+{ticket_content}
+```
+
+## Analysis Instructions
+I need you to carefully analyze this Jira ticket to determine if it contains sufficient information for a developer to implement the requested feature or fix without needing to ask additional questions. Consider the perspective of a developer who needs to write code based solely on this ticket.
+
+## Required Analysis Framework
+Analyze the ticket across these dimensions:
+
+1. **Problem Statement** (0-10):
+   - Is the issue or feature request clearly defined?
+   - Is the business value and purpose explained?
+   - Does it clearly state what needs to be built or fixed?
+
+2. **Technical Requirements** (0-10):
+   - Are specific technical requirements provided?
+   - Is the expected implementation approach described?
+   - Are there specific libraries, frameworks, or technologies mentioned that should be used?
+
+3. **Acceptance Criteria** (0-10):
+   - Are there clear, measurable criteria for success?
+   - Are the expected outcomes explicitly stated?
+   - Can a developer test their implementation against these criteria?
+
+4. **Dependencies** (0-10):
+   - Are relationships to other systems or components identified?
+   - Are there external services or APIs that need to be integrated?
+   - Are there configuration requirements or environment dependencies?
+
+5. **Input/Output Specifications** (0-10):
+   - Are data formats and expected behaviors described?
+   - Are API endpoints, parameters, and return values specified?
+   - Are UI elements and user interactions detailed?
+
+6. **Edge Cases** (0-10):
+   - Are potential edge cases or error conditions addressed?
+   - Is error handling described?
+   - Are validation requirements specified?
+
+7. **Constraints** (0-10):
+   - Are performance requirements specified?
+   - Are security considerations addressed?
+   - Are there other non-functional requirements (scalability, reliability, etc.)?
+
+8. **Context** (0-10):
+   - Is sufficient background information provided?
+   - Is the ticket related to existing code or features?
+   - Would a developer understand where this fits in the larger system?
+
+## Scoring Guide
+For each criterion:
+- 0-2: Critically insufficient - No information provided
+- 3-4: Insufficient - Minimal information, too vague to implement
+- 5-6: Somewhat sufficient - Basic information, but significant gaps remain
+- 7-8: Mostly sufficient - Good information with minor gaps
+- 9-10: Fully sufficient - Complete and detailed information
+
+## Response Format
+Return your analysis as a JSON object with the following structure. Be sure to provide detailed, specific feedback for each criterion:
+
+```json
+{{
+    "ticket_id": "Extracted or provided ticket ID, or 'Unknown' if not available",
+    "title": "Extracted or provided ticket title, or brief summary if not available",
+    "is_sufficient": true/false,
+    "overall_score": 0-10,
+    "criteria_scores": {{
+        "problem_statement": 0-10,
+        "technical_requirements": 0-10,
+        "acceptance_criteria": 0-10,
+        "dependencies": 0-10,
+        "input_output": 0-10,
+        "edge_cases": 0-10,
+        "constraints": 0-10,
+        "context": 0-10
+    }},
+    "missing_information": ["Specific missing information item 1", "Specific missing information item 2", ...],
+    "suggested_questions": ["Specific question to ask to gather missing information 1", "Specific question 2", ...],
+    "analysis": "Detailed explanation of your analysis, including strengths and weaknesses of the ticket. Be specific about what information is missing and why it matters for code implementation."
+}}
+```
+
+## Important Notes
+- Focus on specific, actionable feedback
+- Identify concrete examples of missing information
+- Suggest specific questions that would help gather missing information
+- Consider what a developer would need to know to implement this ticket without further clarification
+- If the ticket is insufficient, explain what specific information would make it sufficient
+
+Provide only the JSON object in your response, no additional text or explanations.
+"""
+        return prompt
+    
+    def analyze_ticket(self, ticket_content: str) -> TicketAnalysis:
+        """Analyze a Jira ticket using the LLM"""
+        prompt = self.create_analysis_prompt(ticket_content)
+        
+        try:
+            logger.info("Sending ticket for analysis")
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1  # Lower temperature for more consistent analysis
+            )
+            
+            # Parse the response
+            result = json.loads(response.choices[0].message.content)
+            
+            # Create and return the analysis object
+            analysis = TicketAnalysis(
+                ticket_id=result.get("ticket_id", "Unknown"),
+                title=result.get("title", "Unknown"),
+                is_sufficient=result.get("is_sufficient", False),
+                overall_score=result.get("overall_score", 0),
+                criteria_scores=result.get("criteria_scores", {}),
+                missing_information=result.get("missing_information", []),
+                suggested_questions=result.get("suggested_questions", []),
+                analysis=result.get("analysis", ""),
+                completion_tokens=response.usage.completion_tokens,
+                prompt_tokens=response.usage.prompt_tokens
+            )
+            
+            logger.info(f"Analysis complete. Overall score: {analysis.overall_score}/10")
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error analyzing ticket: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def batch_analyze(self, tickets: List[str]) -> List[TicketAnalysis]:
+        """Analyze multiple tickets in batch"""
+        results = []
+        for i, ticket in enumerate(tickets):
+            logger.info(f"Analyzing ticket {i+1}/{len(tickets)}")
+            try:
+                result = self.analyze_ticket(ticket)
+                results.append(result)
+                # Add a small delay to avoid rate limiting
+                if i < len(tickets) - 1:
+                    time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Error analyzing ticket {i+1}: {str(e)}")
+        return results
+
+
+class JiraConnector:
+    """Class to connect to Jira and fetch tickets"""
+    
+    def __init__(self, jira_url: str, username: str, api_token: str):
+        """Initialize the Jira connector"""
+        if not JIRA_AVAILABLE:
+            raise ImportError("Jira package is not installed. Install it with 'pip install jira'")
+        
+        self.jira = JIRA(server=jira_url, basic_auth=(username, api_token))
+        logger.info(f"Connected to Jira instance at {jira_url}")
+    
+    def get_ticket(self, ticket_id: str) -> str:
+        """Fetch a single ticket by ID"""
+        issue = self.jira.issue(ticket_id)
+        
+        # Format the ticket content
+        ticket_content = f"""
+ID: {issue.key}
+Title: {issue.fields.summary}
+Type: {issue.fields.issuetype.name}
+Priority: {issue.fields.priority.name}
+Status: {issue.fields.status.name}
+Reporter: {issue.fields.reporter.displayName}
+Assignee: {issue.fields.assignee.displayName if issue.fields.assignee else 'Unassigned'}
+
+Description:
+{issue.fields.description or 'No description provided'}
+
+Acceptance Criteria:
+{getattr(issue.fields, 'customfield_10000', 'No acceptance criteria provided')}
+"""
+        return ticket_content
+    
+    def get_tickets_by_query(self, jql_query: str, max_results: int = 10) -> List[str]:
+        """Fetch multiple tickets using a JQL query"""
+        issues = self.jira.search_issues(jql_query, maxResults=max_results)
+        
+        ticket_contents = []
+        for issue in issues:
+            ticket_content = f"""
+ID: {issue.key}
+Title: {issue.fields.summary}
+Type: {issue.fields.issuetype.name}
+Priority: {issue.fields.priority.name}
+Status: {issue.fields.status.name}
+Reporter: {issue.fields.reporter.displayName}
+Assignee: {issue.fields.assignee.displayName if issue.fields.assignee else 'Unassigned'}
+
+Description:
+{issue.fields.description or 'No description provided'}
+
+Acceptance Criteria:
+{getattr(issue.fields, 'customfield_10000', 'No acceptance criteria provided')}
+"""
+            ticket_contents.append(ticket_content)
+        
+        return ticket_contents
+
+
+class OutputFormatter:
+    """Class to format analysis results in various formats"""
+    
+    @staticmethod
+    def to_json(analysis: Union[TicketAnalysis, List[TicketAnalysis]], file_path: Optional[str] = None) -> str:
+        """Format analysis results as JSON"""
+        if isinstance(analysis, list):
+            result = [a.to_dict() for a in analysis]
+        else:
+            result = analysis.to_dict()
+        
+        json_str = json.dumps(result, indent=2)
+        
+        if file_path:
+            with open(file_path, 'w') as f:
+                f.write(json_str)
+            logger.info(f"Results saved to {file_path}")
+        
+        return json_str
+    
+    @staticmethod
+    def to_csv(analyses: List[TicketAnalysis], file_path: str) -> None:
+        """Format analysis results as CSV"""
+        if not PANDAS_AVAILABLE:
+            raise ImportError("Pandas package is not installed. Install it with 'pip install pandas'")
+        
+        # Convert analyses to dictionaries
+        data = [a.to_dict() for a in analyses]
+        
+        # Flatten the criteria_scores dict
+        for item in data:
+            for key, value in item['criteria_scores'].items():
+                item[f'score_{key}'] = value
+            del item['criteria_scores']
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(data)
+        
+        # Write to CSV
+        df.to_csv(file_path, index=False)
+        logger.info(f"Results saved to {file_path}")
+    
+    @staticmethod
+    def to_html_report(analyses: List[TicketAnalysis], file_path: str) -> None:
+        """Format analysis results as an HTML report"""
+        if not PANDAS_AVAILABLE:
+            raise ImportError("Pandas package is not installed. Install it with 'pip install pandas'")
+        
+        # Convert analyses to dictionaries
+        data = [a.to_dict() for a in analyses]
+        
+        # Create a DataFrame
+        df = pd.DataFrame(data)
+        
+        # Create an HTML report
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Jira Ticket Analysis Report</title>
+            <style>
+                body {{
